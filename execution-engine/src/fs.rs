@@ -46,11 +46,148 @@ pub type FileSystemResult<T> = Result<T, ErrNo>;
 /// data buffer.
 #[derive(Clone, Debug)]
 struct InodeEntry {
+    /// The parent inode.
+    parent: Inode, 
+    /// The path of this inode relative to the parent.
+    path: PathBuf,
     /// The status of this file.
     file_stat: FileStat,
-    /// The content of the file in bytes.  NOTE: the buffer.size() *must* match
-    /// with `file_stat.file_size`.
-    raw_file_data: Vec<u8>,
+    /// The content of the inode.
+    data: InodeImpl,
+}
+
+impl InodeEntry {
+    /// Resize a file to `size`, and fill with `fill_byte` if it grows
+    /// and update the file status.
+    /// Return ErrNo::IsDir, if it is not a file
+    pub(self) fn resize_file(&mut self, size: FileSize, fill_byte: u8) -> FileSystemError<()> {
+        self.data.resize_file(size, fill_byte)?;
+        self.file_stat.file_size = size;
+        Ok(())
+    }
+
+    /// Read maximum `max` bytes from the offset `offset`.
+    /// Return ErrNo::IsDir if it is not a file.
+    pub(self) fn read_file(&self, max: usize, offset: FileSize) -> FileSystemError<Vec<u8>> {
+        self.data.read_file(max, offset)
+    }
+
+
+    /// Write `buf` to the file from the offset `offset`,
+    /// update the file status and return the number of written bytes.
+    /// Otherwise, return ErrNo::IsDir if it is not a file.
+    pub(self) fn write_file(&mut self, buf: Vec<u8>, offset: FileSize) -> FileSystemError<Size> {
+        let rst = self.data.write_file(buf, offset)?;
+        self.file_stat.file_size = self.data.len()?;
+        Ok(rst)
+    }
+
+    /// Truncate the file.
+    /// Return ErrNo::IsDir if it is not a file.
+    pub(self) fn truncate_file(&mut self) -> FileSystemError<()> {
+        self.data.truncate_file()?;
+        self.file_stat.file_size = 0u64;
+        Ok(())
+    }
+}
+
+/// The actual data of an inode, either a file or a directory.
+#[derive(Clone, Debug)]
+enum InodeImpl {
+    /// A file
+    File(Vec<u8>),
+    /// A directory. The `PathBuf` key must  match to the name inside the `Inode`.
+    Directory(HashMap<PathBuf, Inode>),
+}
+
+impl InodeImpl {
+    /// Resize a file to `size`, and fill with `fill_byte` if it grows.
+    /// Otherwise, return ErrNo::IsDir if it is not a file.
+    pub(self) fn resize_file(&mut self, size: FileSize, fill_byte: u8) -> FileSystemError<()> {
+        match self {
+            Self::File(file) => { file.resize(size as usize, fill_byte); Ok(()) },
+            Self::Directory(_) => Err(ErrNo::IsDir)
+        }
+    }
+
+    /// Read maximum `max` bytes from the offset `offset`.
+    /// Otherwise, return ErrNo::IsDir if it is not a file.
+    pub(self) fn read_file(&self, max: usize, offset: FileSize) -> FileSystemError<Vec<u8>> {
+        let bytes =  match self {
+            Self::File(b) => b,
+            Self::Directory(_) => return Err(ErrNo::IsDir),
+        };
+        // NOTE: It should be safe to convert a u64 to usize.
+        let offset = offset as usize;
+        //          offset
+        //             v
+        // ---------------------------------------------
+        // |  ....     | to_read              |        |
+        // ---------------------------------------------
+        //             v ...  read_length ... v
+        //             ------------------------
+        //             | rst                  |
+        //             ------------------------
+        let (_, to_read) = bytes.split_at(offset);
+        let read_length = if max < to_read.len() {
+            max
+        } else {
+            to_read.len()
+        };
+        let (rst, _) = to_read.split_at(read_length);
+        info!("call read_file read {:?} bytes", rst.len());
+        Ok(rst.to_vec())
+    }
+
+    /// Write `buf` to the file from the offset `offset` and return the number of written bytes.
+    /// Otherwise, return ErrNo::IsDir if it is not a file.
+    pub(self) fn write_file(&mut self, buf: Vec<u8>, offset: FileSize) -> FileSystemError<Size> {
+        let bytes =  match self {
+            Self::File(b) => b,
+            Self::Directory(_) => return Err(ErrNo::IsDir),
+        };
+        info!("call write_file before: {:?}", bytes.len());
+        // NOTE: It should be safe to convert a u64 to usize.
+        let offset = offset as usize;
+        //          offset
+        //             v  .. remain_length .. v
+        // ----------------------------------------------
+        // |  ....     | to_write             0 0 ...   |
+        // ----------------------------------------------
+        //             v     ...    buf.len()    ...    v
+        //             ----------------------------------
+        //             | buf                            |
+        //             ----------------------------------
+        let remain_length = bytes.len() - offset;
+        if remain_length <= buf.len() {
+            info!("call fd_pwrite grows length");
+            let mut grow_vec = vec![0; buf.len() - remain_length];
+            bytes.append(&mut grow_vec);
+        }
+        let rst = buf.len();
+        bytes[offset..(offset + rst)].copy_from_slice(&buf);
+        info!("call write_file result: {:?}", bytes.len());
+        Ok(rst as Size)
+    }
+
+    /// Truncate the file.
+    /// Return ErrNo::IsDir if it is not a file.
+    pub(self) fn truncate_file(&mut self) -> FileSystemError<()> {
+        match self {
+            Self::File(b) => { b.clear() ; Ok(())},
+            Self::Directory(_) => Err(ErrNo::IsDir),
+        }
+    }
+
+    /// Return the number of the bytes, if it is a file, 
+    /// or the number of inodes, if it it is a directory.
+    pub(self) fn len(&self) -> FileSystemError<FileSize> {
+        let rst = match self {
+            Self::File(f) => f.len(),
+            Self::Directory(f) => f.len(),
+        };
+        Ok(rst as FileSize)
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -186,8 +323,11 @@ impl FileSystem {
             ctime: Timestamp::from_nanos(0),
         };
         let node = InodeEntry {
+            // TODO change.
+            parent: Inode(3),
             file_stat,
-            raw_file_data: Vec::new(),
+            path: path.as_ref().to_path_buf(),
+            data: InodeImpl::Directory(HashMap::new()),
         };
         self.inode_table.insert(inode.clone(), node);
         self.path_table
@@ -208,8 +348,11 @@ impl FileSystem {
             ctime: Timestamp::from_nanos(0),
         };
         let node = InodeEntry {
+            // TODO change.
+            parent: Inode(3),
             file_stat,
-            raw_file_data: raw_file_data.to_vec(),
+            path: path.as_ref().to_path_buf(),
+            data: InodeImpl::File(raw_file_data.to_vec()),
         };
         self.inode_table.insert(inode.clone(), node);
         self.path_table
@@ -413,10 +556,7 @@ impl FileSystem {
             .map(|FileTableEntry { inode, .. }| inode.clone())
             .ok_or(ErrNo::BadF)?;
 
-        let inode_impl = self.inode_table.get_mut(&inode).ok_or(ErrNo::NoEnt)?;
-        inode_impl.file_stat.file_size = size;
-        inode_impl.raw_file_data.resize(size as usize, 0);
-        Ok(())
+        self.inode_table.get_mut(&inode).ok_or(ErrNo::NoEnt)?.resize_file(size, 0)
     }
 
     /// Change the time of the open file pointed by the file descriptor, `fd`. If `fst_flags`
@@ -459,17 +599,15 @@ impl FileSystem {
     /// That is, different engines provide different API to interact the linear memory
     /// space of WASM. Hence, the method here return the read bytes as `Vec<u8>`.
     pub(crate) fn fd_pread(
-        &mut self,
+        &self,
         fd: Fd,
         buffer_len: usize,
         offset: FileSize,
     ) -> FileSystemResult<Vec<u8>> {
         self.check_right(&fd, Rights::FD_READ)?;
         let inode = self.fd_table.get(&fd).ok_or(ErrNo::BadF)?.inode;
-        // NOTE: It should be safe to convert a u64 to usize.
-        let offset = offset as usize;
 
-        let buffer = &self
+        self
             .inode_table
             .get(&inode)
             .ok_or(ErrNo::NoEnt)?
@@ -801,9 +939,9 @@ impl FileSystem {
             if !principal_right.contains(Rights::PATH_FILESTAT_SET_SIZE) {
                 return Err(ErrNo::Access);
             }
-            let inode_impl = self.inode_table.get_mut(&inode).ok_or(ErrNo::NoEnt)?;
-            inode_impl.raw_file_data = Vec::new();
-            inode_impl.file_stat.file_size = 0u64;
+            self.inode_table.get_mut(&inode).ok_or(ErrNo::NoEnt)?.truncate_file()?;
+            //inode_impl.raw_file_data = Vec::new();
+            //inode_impl.file_stat.file_size = 0u64;
         }
         let new_fd = self.new_fd()?;
         let FileStat {
