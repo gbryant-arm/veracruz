@@ -262,7 +262,7 @@ impl FileSystem {
             rights_table,
             prestat_table: HashMap::new(),
         };
-        rst.install_prestat(&vec![""]);
+        rst.install_prestat::<PathBuf>(&Vec::new());
         rst
     }
 
@@ -782,6 +782,19 @@ impl FileSystem {
     /// A rust-style base implementation for `fd_write`. It directly calls `fd_pwrite` with the
     /// current `offset` of Fd `fd` and then calls `fd_seek`.
     pub(crate) fn fd_write(&mut self, fd: Fd, buf: &[u8]) -> FileSystemResult<Size> {
+        info!("call fd_write on {:?}", fd);
+
+        // Redirect writes to fd(0) and fd(1) to the host's stdin and stderr respectively
+        if fd.0 == 0 || fd.0 == 1 {
+            let s = std::str::from_utf8(&buf).expect("Found invalid UTF-8");
+            print!("{}", s);
+            return Ok(buf.len() as u32)
+        } else if fd.0 == 2 {
+            let s = std::str::from_utf8(&buf).expect("Found invalid UTF-8");
+            eprint!("{}", s);
+            return Ok(buf.len() as u32)
+        }
+
         self.check_right(&fd, Rights::FD_WRITE)?;
         let offset = self.fd_table.get(&fd).ok_or(ErrNo::BadF)?.offset;
 
@@ -885,6 +898,8 @@ impl FileSystem {
         let path = path.as_ref();
         // ONLY allow search on the root for now.
         if fd != Self::ROOT_DIRECTORY_FD {
+            info!("fd != Self::ROOT_DIRECTORY_FD");
+            info!("{}", format!("path: {:?}", path));
             return Err(ErrNo::NotDir);
         }
         // NOTE: A pontential better way to control capability is to
@@ -892,8 +907,10 @@ impl FileSystem {
 
         // Read the right related to the principal.
         let principal_right = if *principal != Principal::InternalSuperUser {
+            info!("not a super user");
             self.get_right(&principal, path)?
         } else {
+            info!("super user rights!");
             Rights::all()
         };
         // Intersect with the inheriting right from `fd`
@@ -906,6 +923,7 @@ impl FileSystem {
         let principal_right = principal_right & fd_inheriting;
         // Check the right of the program on path_open
         if !principal_right.contains(Rights::PATH_OPEN) {
+            info!("no access right");
             return Err(ErrNo::Access);
         }
         let rights_base = rights_base & principal_right;
@@ -915,6 +933,7 @@ impl FileSystem {
             Some(i) => {
                 // If file exists and `excl` is set, return `Exist` error.
                 if oflags.contains(OpenFlags::EXCL) {
+                    info!("err: file exists");
                     return Err(ErrNo::Exist);
                 }
                 i.clone()

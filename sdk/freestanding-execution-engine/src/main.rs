@@ -232,7 +232,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     for file_path in cmdline.data_sources.iter() {
         file_table.insert(PathBuf::from(file_path), read_right);
     }
-    file_table.insert(PathBuf::from(OUTPUT_FILE), write_right);
+    file_table.insert(PathBuf::from(OUTPUT_FILE), write_right | read_right);
     right_table.insert(Principal::Program(prog_file_name.to_string()), file_table);
 
     let vfs = Arc::new(Mutex::new(FileSystem::new(right_table)));
